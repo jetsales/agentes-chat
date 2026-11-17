@@ -1,0 +1,66 @@
+name: ocir-image
+
+# Publica a imagem do Dockerfile da raiz no OCIR JetSales
+# (GRU.ocir.io/<namespace>/agentes-chat), no mesmo registry das imagens
+# padrão (jetsales-platform-default-images). Sem publish em pull_request.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ocir-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: agentes-chat
+  # Os nodes do OKE são arm64; amd64 serve para testar no runner.
+  PLATFORMS: linux/arm64,linux/amd64
+  OCIR_REGISTRY: GRU.ocir.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      OCIR_USERNAME: ${{ secrets.OCR_USERNAME }}
+      OCIR_PASSWORD: ${{ secrets.OCR_PASSWORD }}
+      OCIR_NAMESPACE: ${{ secrets.OCR_TENANCY_NAMESPACE }}
+      # Tag imutável: SHA completo do commit (é o que a plataforma deve piná-lo).
+      IMAGE_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Secrets de org já usados em jetsales-platform e jetsales-platform-default-images.
+      # Se este repo não estiver na visibilidade deles, falhamos com mensagem clara.
+      - name: exigir secrets de org
+        run: |
+          missing=()
+          [ -n "${OCIR_USERNAME}" ] || missing+=(OCR_USERNAME)
+          [ -n "${OCIR_PASSWORD}" ] || missing+=(OCR_PASSWORD)
+          [ -n "${OCIR_NAMESPACE}" ] || missing+=(OCR_TENANCY_NAMESPACE)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::secrets ausentes: ${missing[*]}. Inclua este repositório na visibilidade dos secrets de organização OCR_* (não crie secret novo neste repo)."
+            exit 1
+          fi
+
+      - name: login no OCIR
+        run: echo "$OCIR_PASSWORD" | docker login "$OCIR_REGISTRY" -u "$OCIR_USERNAME" --password-stdin
+
+      - name: buildx
+        run: docker buildx create --use --name multiarch
+
+      # SHA sempre; latest só no push da main, como ponteiro móvel.
+      - name: publicar no OCIR
+        run: |
+          sha_ref="${OCIR_REGISTRY}/${OCIR_NAMESPACE}/${IMAGE_NAME}:${IMAGE_SHA}"
+          tags=(-t "$sha_ref")
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tags+=(-t "${OCIR_REGISTRY}/${OCIR_NAMESPACE}/${IMAGE_NAME}:latest")
+          fi
+          docker buildx build --platform "$PLATFORMS" --push "${tags[@]}" .
+          docker buildx imagetools inspect "$sha_ref" | tee /dev/stderr | grep -q "linux/arm64" \
+            || { echo "::error::manifest sem linux/arm64"; exit 1; }
