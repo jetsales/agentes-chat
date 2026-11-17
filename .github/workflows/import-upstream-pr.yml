@@ -1,0 +1,152 @@
+name: Import upstream PR
+
+# Bring one PR from agentes-chat/agentes-chat onto a branch in this fork and open a PR against main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_pr:
+        description: "PR number on agentes-chat/agentes-chat"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: import-upstream-pr-${{ inputs.upstream_pr }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  import:
+    name: Import upstream PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Import PR from upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: agentes-chat/agentes-chat
+          UPSTREAM_URL: https://github.com/agentes-chat/agentes-chat.git
+          UPSTREAM_PR: ${{ inputs.upstream_pr }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "${UPSTREAM_PR}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: upstream_pr must be a positive integer, got: ${UPSTREAM_PR}"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "Looking up ${UPSTREAM_REPO}#${UPSTREAM_PR} ..."
+          if ! PR_JSON=$(gh api "repos/${UPSTREAM_REPO}/pulls/${UPSTREAM_PR}" 2>/tmp/gh-pr-err.txt); then
+            echo "ERROR: failed to fetch upstream PR #${UPSTREAM_PR} from ${UPSTREAM_REPO}"
+            cat /tmp/gh-pr-err.txt >&2 || true
+            exit 1
+          fi
+
+          HEAD_SHA=$(printf '%s' "${PR_JSON}" | jq -r '.head.sha')
+          PR_TITLE=$(printf '%s' "${PR_JSON}" | jq -r '.title')
+          PR_URL=$(printf '%s' "${PR_JSON}" | jq -r '.html_url')
+          PR_STATE=$(printf '%s' "${PR_JSON}" | jq -r '.state')
+
+          if [ -z "${HEAD_SHA}" ] || [ "${HEAD_SHA}" = "null" ]; then
+            echo "ERROR: upstream PR #${UPSTREAM_PR} has no head.sha"
+            exit 1
+          fi
+
+          HEAD_SHORT=$(printf '%s' "${HEAD_SHA}" | cut -c1-12)
+          echo "Upstream PR #${UPSTREAM_PR} state=${PR_STATE} head=${HEAD_SHA}"
+          echo "Title: ${PR_TITLE}"
+
+          BRANCH="upstream-pr-${UPSTREAM_PR}"
+          git remote add upstream "${UPSTREAM_URL}"
+          git fetch origin main
+          # Local temp ref only — does not touch origin/main or any published fork branch.
+          git fetch upstream "pull/${UPSTREAM_PR}/head:refs/tmp/upstream-pr-${UPSTREAM_PR}"
+
+          IMPORTED_SHA=$(git rev-parse "refs/tmp/upstream-pr-${UPSTREAM_PR}")
+          if [ "${IMPORTED_SHA}" != "${HEAD_SHA}" ]; then
+            echo "WARNING: fetched tip ${IMPORTED_SHA} differs from API head ${HEAD_SHA}; using fetched tip."
+            HEAD_SHA="${IMPORTED_SHA}"
+            HEAD_SHORT=$(printf '%s' "${HEAD_SHA}" | cut -c1-12)
+          fi
+
+          is_ancestor() {
+            git merge-base --is-ancestor "$1" "$2"
+          }
+
+          remote_branch_sha() {
+            git ls-remote origin "refs/heads/$1" | awk '{print $1}'
+          }
+
+          push_ff() {
+            local local_ref="$1"
+            local remote_ref="$2"
+            local local_sha remote_sha
+            local_sha=$(git rev-parse "${local_ref}")
+            remote_sha="$(remote_branch_sha "${remote_ref}")"
+            if [ -n "${remote_sha}" ]; then
+              if [ "${remote_sha}" = "${local_sha}" ]; then
+                echo "origin/${remote_ref} already at ${local_sha}"
+                return 0
+              fi
+              git fetch origin "refs/heads/${remote_ref}:refs/remotes/origin/${remote_ref}"
+              if ! is_ancestor "${remote_sha}" "${local_sha}"; then
+                echo "ERROR: refusing non-fast-forward push to origin/${remote_ref}"
+                echo "  remote=${remote_sha}"
+                echo "  local=${local_sha}"
+                return 1
+              fi
+            fi
+            git push origin "${local_ref}:refs/heads/${remote_ref}"
+          }
+
+          existing_pr=$(gh pr list --base main --state open --head "${BRANCH}" \
+            --json number,url --jq '.[0].number // empty' || true)
+
+          git checkout -B "${BRANCH}" "refs/tmp/upstream-pr-${UPSTREAM_PR}"
+
+          if [ -n "$(remote_branch_sha "${BRANCH}")" ]; then
+            if ! push_ff HEAD "${BRANCH}"; then
+              echo "ERROR: branch ${BRANCH} exists and cannot be updated by fast-forward. No force-push."
+              if [ -n "${existing_pr}" ]; then
+                gh pr comment "${existing_pr}" --body \
+                  "Falha ao atualizar \`${BRANCH}\` até \`${HEAD_SHORT}\` sem force-push (histórico divergiu). Upstream: ${UPSTREAM_REPO}#${UPSTREAM_PR}."
+              fi
+              exit 1
+            fi
+          else
+            git push -u origin "HEAD:refs/heads/${BRANCH}"
+          fi
+
+          title="Importar ${UPSTREAM_REPO}#${UPSTREAM_PR}: ${PR_TITLE}"
+          body=$(printf '%s\n' \
+            "Importa a PR [${UPSTREAM_REPO}#${UPSTREAM_PR}](${PR_URL}) para este fork." \
+            "" \
+            "- **SHA importado:** \`${HEAD_SHORT}\` (\`${HEAD_SHA}\`)" \
+            "- **Branch:** \`${BRANCH}\`" \
+            "" \
+            "A Action não faz o merge. Revise e faça o merge manualmente quando for seguro.")
+
+          if [ -n "${existing_pr}" ]; then
+            echo "Open import PR already exists: #${existing_pr}"
+            gh pr comment "${existing_pr}" --body \
+              "Branch \`${BRANCH}\` atualizada por fast-forward para \`${HEAD_SHORT}\` (\`${HEAD_SHA}\`) de ${UPSTREAM_REPO}#${UPSTREAM_PR}."
+            exit 0
+          fi
+
+          gh pr create --base main --head "${BRANCH}" --title "${title}" --body "${body}"
+          echo "Opened import PR for upstream #${UPSTREAM_PR} at ${HEAD_SHORT}."
