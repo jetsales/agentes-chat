@@ -1,0 +1,207 @@
+name: Sync upstream main
+
+# Align jetsales/agentes-chat main with agentes-chat/agentes-chat.
+# Fast-forward origin/main only when the fork has no unique commits; otherwise open a sync PR.
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync:
+    name: Sync upstream/main
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Sync with upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: agentes-chat/agentes-chat
+          UPSTREAM_URL: https://github.com/agentes-chat/agentes-chat.git
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch origin main
+          git fetch upstream main
+
+          ORIGIN_SHA=$(git rev-parse origin/main)
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          UPSTREAM_SHORT=$(git rev-parse --short=12 upstream/main)
+          BRANCH="sync/upstream-main-${UPSTREAM_SHORT}"
+
+          echo "origin/main=${ORIGIN_SHA}"
+          echo "upstream/main=${UPSTREAM_SHA}"
+          echo "sync branch=${BRANCH}"
+
+          if [ "${ORIGIN_SHA}" = "${UPSTREAM_SHA}" ]; then
+            echo "Fork main already matches upstream/main. Nothing to do."
+            exit 0
+          fi
+
+          OWN_COUNT=$(git rev-list --count "upstream/main..origin/main")
+          echo "Fork-only commits: ${OWN_COUNT}"
+
+          is_ancestor() {
+            git merge-base --is-ancestor "$1" "$2"
+          }
+
+          remote_branch_sha() {
+            git ls-remote origin "refs/heads/$1" | awk '{print $1}'
+          }
+
+          # Fetch a remote branch into refs/remotes/origin/<name> when it exists (no force).
+          fetch_remote_branch() {
+            local name="$1"
+            local sha
+            sha="$(remote_branch_sha "${name}")"
+            if [ -n "${sha}" ]; then
+              git fetch origin "refs/heads/${name}:refs/remotes/origin/${name}"
+            fi
+          }
+
+          # Push only when the remote tip is missing or a strict ancestor of local (true fast-forward).
+          push_ff() {
+            local local_ref="$1"
+            local remote_ref="$2"
+            local local_sha remote_sha
+            local_sha=$(git rev-parse "${local_ref}")
+            remote_sha="$(remote_branch_sha "${remote_ref}")"
+            if [ -n "${remote_sha}" ]; then
+              if [ "${remote_sha}" = "${local_sha}" ]; then
+                echo "origin/${remote_ref} already at ${local_sha}"
+                return 0
+              fi
+              # Ensure remote tip is local so merge-base works.
+              git fetch origin "refs/heads/${remote_ref}:refs/remotes/origin/${remote_ref}"
+              if ! is_ancestor "${remote_sha}" "${local_sha}"; then
+                echo "ERROR: refusing non-fast-forward push to origin/${remote_ref}"
+                echo "  remote=${remote_sha}"
+                echo "  local=${local_sha}"
+                return 1
+              fi
+            fi
+            git push origin "${local_ref}:refs/heads/${remote_ref}"
+          }
+
+          find_open_sync_pr() {
+            gh pr list --base main --state open --head "${BRANCH}" \
+              --json number,url --jq '.[0].number // empty'
+          }
+
+          ensure_pr() {
+            local reason="$1"
+            local existing_pr="$2"
+            local title="Sincronizar main com upstream ${UPSTREAM_SHORT}"
+            local body
+            body=$(printf '%s\n' \
+              "Esta PR traz \`upstream/main\` (\`${UPSTREAM_SHORT}\` / \`${UPSTREAM_SHA}\`) de [\`${UPSTREAM_REPO}\`](https://github.com/${UPSTREAM_REPO}) para a main deste fork." \
+              "" \
+              "**Motivo:** ${reason}" \
+              "" \
+              "A Action não faz o merge. Revise e faça o merge manualmente quando for seguro.")
+
+            if [ -n "${existing_pr}" ]; then
+              echo "Open sync PR already exists: #${existing_pr}"
+              gh pr comment "${existing_pr}" --body \
+                "Sync idempotente para upstream \`${UPSTREAM_SHORT}\` (\`${UPSTREAM_SHA}\`). Motivo: ${reason}."
+              return 0
+            fi
+            gh pr create --base main --head "${BRANCH}" --title "${title}" --body "${body}"
+          }
+
+          ensure_sync_branch_and_pr() {
+            local reason="$1"
+            local existing_pr remote_sha desired merge_ok=0
+            existing_pr="$(find_open_sync_pr || true)"
+            fetch_remote_branch "${BRANCH}"
+            remote_sha="$(remote_branch_sha "${BRANCH}")"
+
+            # Desired tip: merge commit when clean (PR born mergeable); else upstream tip
+            # so GitHub shows the conflict against main. Never commit conflict markers.
+            git checkout -B "${BRANCH}" origin/main
+            if git merge --no-edit --no-ff upstream/main; then
+              merge_ok=1
+              desired=$(git rev-parse HEAD)
+              echo "Clean merge onto sync branch ${BRANCH} at ${desired}."
+            else
+              echo "Merge conflict; sync branch will point at upstream/main."
+              git merge --abort || true
+              git checkout -B "${BRANCH}" upstream/main
+              desired=$(git rev-parse HEAD)
+            fi
+
+            if [ -n "${remote_sha}" ]; then
+              if [ "${remote_sha}" = "${desired}" ]; then
+                echo "origin/${BRANCH} already at desired tip."
+              elif is_ancestor "${remote_sha}" "${desired}"; then
+                echo "Fast-forwarding origin/${BRANCH} to ${desired}."
+                if ! push_ff "${desired}" "${BRANCH}"; then
+                  if [ -n "${existing_pr}" ]; then
+                    gh pr comment "${existing_pr}" --body \
+                      "Não foi possível atualizar \`${BRANCH}\` até \`${UPSTREAM_SHORT}\` sem force-push. Motivo: ${reason}."
+                  fi
+                  exit 1
+                fi
+              elif is_ancestor "${UPSTREAM_SHA}" "${remote_sha}"; then
+                # Re-run built a new merge commit; remote already contains this upstream tip.
+                echo "origin/${BRANCH} already includes upstream ${UPSTREAM_SHORT}; leaving branch unchanged (no force-push)."
+              else
+                echo "ERROR: cannot update origin/${BRANCH} without force-push."
+                echo "  remote=${remote_sha}"
+                echo "  desired=${desired}"
+                echo "  upstream=${UPSTREAM_SHA}"
+                if [ -n "${existing_pr}" ]; then
+                  gh pr comment "${existing_pr}" --body \
+                    "Não foi possível atualizar \`${BRANCH}\` até upstream \`${UPSTREAM_SHORT}\` sem force-push. Motivo: ${reason}."
+                fi
+                exit 1
+              fi
+            else
+              git push -u origin "${desired}:refs/heads/${BRANCH}"
+            fi
+
+            ensure_pr "${reason}" "${existing_pr}"
+            if [ "${merge_ok}" -eq 1 ]; then
+              echo "Sync PR path ready with clean merge on ${BRANCH}."
+            else
+              echo "Sync PR path ready; GitHub should report merge conflicts against main."
+            fi
+          }
+
+          if [ "${OWN_COUNT}" -eq 0 ] && is_ancestor "${ORIGIN_SHA}" "${UPSTREAM_SHA}"; then
+            echo "No fork-only commits; fast-forwarding origin/main to upstream/main."
+            git push origin "upstream/main:refs/heads/main"
+            echo "Fast-forward push of main succeeded."
+            exit 0
+          fi
+
+          if [ "${OWN_COUNT}" -gt 0 ]; then
+            REASON="a main do fork tem ${OWN_COUNT} commit(s) próprio(s) que não estão no upstream"
+          else
+            REASON="fast-forward de origin/main até upstream/main não é possível (históricos divergiram)"
+          fi
+
+          echo "Will not push to main: ${REASON}"
+          ensure_sync_branch_and_pr "${REASON}"
